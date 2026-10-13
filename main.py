@@ -83,6 +83,16 @@ def submit_once(questionnaire: Questionnaire, names: list[str], openid: str,
     count, last_at = client.history(openid)
     state.sync_history(key, count, last_at)
     current = state.status(key)
+    if current.get("in_flight"):
+        pending = [item for item in state.pending() if item["identity"] == key]
+        # A previous process may have died after the server accepted the request
+        # but before finish(). Reconcile only with strong evidence: remote count
+        # covers the local reservation and the remote record is not older than it.
+        if (len(pending) == 1 and count >= current["used"] and last_at is not None
+                and last_at >= pending[0]["reserved_at"]):
+            state.finish(pending[0]["attempt_id"], "success", now=last_at)
+            log(f"检测到上次进程遗留记录 {pending[0]['attempt_id']} 已出现在服务端历史中；自动确认成功，不重复提交。")
+            current = state.status(key)
     log(f"账号历史 {count} 次；本地保守计次 {current['used']}/10，剩余 {current['remaining']} 次。")
     last_at = current.get("last_at")
     if last_at is not None:
@@ -92,7 +102,8 @@ def submit_once(questionnaire: Questionnaire, names: list[str], openid: str,
         message = "本地额度或301秒间隔阻止本次操作"
         if current.get("in_flight"):
             message = "存在未结束提交；请先确认原进程停止并核实结果，再执行 recover-pending --confirm-stopped"
-        raise LimitError(message, wait_seconds=current["wait_seconds"], exhausted=current["remaining"] == 0)
+        reason = "in_flight" if current.get("in_flight") else ("exhausted" if current["remaining"] == 0 else "cooldown")
+        raise LimitError(message, wait_seconds=current["wait_seconds"], exhausted=current["remaining"] == 0, identity=key, reason=reason)
     schema = client.available_questions(openid, questionnaire.survey_id)
     questionnaire.check_live_schema(schema)
     payload = questionnaire.build(openid, names)
@@ -228,7 +239,14 @@ def main(argv=None) -> int:
                 run_submissions(questionnaire, names, openid, ApiClient(), state, count=args.count, wait=args.wait)
         return 0
     except LimitError as exc:
-        log(f"已停止：{exc}；仍需等待 {math.ceil(exc.wait_seconds)} 秒。", "ERROR")
+        suffix = ""
+        if exc.exhausted:
+            suffix = "；当前账号十次额度已用完"
+        elif exc.pending:
+            suffix = "；该状态不能靠等待自动解除"
+        elif exc.wait_seconds:
+            suffix = f"；仍需等待 {math.ceil(exc.wait_seconds)} 秒"
+        log(f"已停止：{exc}{suffix}。", "ERROR")
         return 2
     except (ApiError, ValueError) as exc:
         # Our business exceptions never include raw request/response credentials.

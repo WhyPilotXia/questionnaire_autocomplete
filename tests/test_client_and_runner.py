@@ -177,6 +177,31 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(sleep.call_count, 1)
         self.assertEqual(self.client.submit.call_count, 2)
 
+    def test_remote_history_reconciles_crash_pending_as_success(self):
+        wall = 1000.0
+        with patch("submission_state.time.time", return_value=wall):
+            attempt = self.state.reserve(self.key)
+        self.client.history.return_value = (1, wall + 11)
+        with patch("submission_state.time.time", return_value=wall + 11), redirect_stdout(io.StringIO()) as output:
+            with self.assertRaises(LimitError) as raised:
+                submit_once(self.questionnaire, ["测试"], self.openid, self.client, self.state)
+        self.assertFalse(raised.exception.pending)
+        self.assertGreater(raised.exception.wait_seconds, 0)
+        self.assertFalse(self.state.status(self.key, now=wall + 11)["pending"])
+        attempts = {item[0]: item[1] for item in self.state._connect().execute("SELECT attempt_id,outcome FROM attempts").fetchall()}
+        self.assertEqual(attempts[attempt], "success")
+        self.assertIn("自动确认成功", output.getvalue())
+        self.client.submit.assert_not_called()
+
+    def test_old_remote_history_does_not_reconcile_pending(self):
+        with patch("submission_state.time.time", return_value=1000):
+            self.state.reserve(self.key)
+        self.client.history.return_value = (1, 900)
+        with self.assertRaises(LimitError) as raised:
+            submit_once(self.questionnaire, ["测试"], self.openid, self.client, self.state)
+        self.assertTrue(raised.exception.pending)
+        self.client.submit.assert_not_called()
+
     def test_pending_stops_wait_loop_instead_of_auto_recovery(self):
         self.state.reserve(self.key)
         with patch("main.time.sleep") as sleep, redirect_stdout(io.StringIO()):
