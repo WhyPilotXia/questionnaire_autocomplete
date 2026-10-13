@@ -71,7 +71,7 @@ def add_run_options(parser, *, child=False):
     identity = parser.add_mutually_exclusive_group()
     identity.add_argument("--openid", default=default, help="当前微信 openid；省略时读取 local_settings.py 的 OPENID")
     identity.add_argument("--account", default=default, help="可选：使用先前导入的账号别名")
-    parser.add_argument("--count", type=int, choices=range(1, 11), default=argparse.SUPPRESS if child else DEFAULT_COUNT, help="本轮最多提交次数，默认10次（不超过账号剩余额度）")
+    parser.add_argument("--count", type=int, choices=range(1, 11), default=argparse.SUPPRESS if child else DEFAULT_COUNT, help="本轮提交次数，默认10次；与历史累计次数无关")
     parser.add_argument("--wait", action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS if child else True, help="默认自动等待301秒间隔；--no-wait 遇冷却立即退出")
     parser.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS if child else False, help="仅离线预览，不联网、不计次")
 
@@ -93,17 +93,17 @@ def submit_once(questionnaire: Questionnaire, names: list[str], openid: str,
             state.finish(pending[0]["attempt_id"], "success", now=last_at)
             log(f"检测到上次进程遗留记录 {pending[0]['attempt_id']} 已出现在服务端历史中；自动确认成功，不重复提交。")
             current = state.status(key)
-    log(f"账号历史 {count} 次；本地保守计次 {current['used']}/10，剩余 {current['remaining']} 次。")
+    log(f"账号历史 {count} 次；本地保守累计 {current['used']} 次（累计次数不设上限）。")
     last_at = current.get("last_at")
     if last_at is not None:
         current["wait_seconds"] = max(current["wait_seconds"], math.ceil(max(0, last_at + SUBMISSION_INTERVAL_SECONDS - time.time())))
         current["blocked"] = current["blocked"] or current["wait_seconds"] > 0
     if current["blocked"]:
-        message = "本地额度或301秒间隔阻止本次操作"
+        message = "本地301秒间隔阻止本次操作"
         if current.get("in_flight"):
             message = "存在未结束提交；请先确认原进程停止并核实结果，再执行 recover-pending --confirm-stopped"
-        reason = "in_flight" if current.get("in_flight") else ("exhausted" if current["remaining"] == 0 else "cooldown")
-        raise LimitError(message, wait_seconds=current["wait_seconds"], exhausted=current["remaining"] == 0, identity=key, reason=reason)
+        reason = "in_flight" if current.get("in_flight") else "cooldown"
+        raise LimitError(message, wait_seconds=current["wait_seconds"], exhausted=False, identity=key, reason=reason)
     schema = client.available_questions(openid, questionnaire.survey_id)
     questionnaire.check_live_schema(schema)
     payload = questionnaire.build(openid, names)
@@ -135,9 +135,6 @@ def run_submissions(questionnaire, names, openid, client, state, *, count, wait)
             result = submit_once(questionnaire, names, openid, client, state)
         except LimitError as exc:
             status = state.status(key)
-            if exc.exhausted:
-                log(f"当前账号十次总额度已用完；本轮成功 {completed} 次，停止。")
-                return completed
             if not wait or not status["wait_seconds"] or status.get("in_flight", False):
                 log(f"提交受限：{exc}；本轮成功 {completed} 次。", "ERROR")
                 raise
@@ -152,10 +149,6 @@ def run_submissions(questionnaire, names, openid, client, state, *, count, wait)
         completed += 1
         log(f"第 {completed}/{count} 次提交成功；记录 {result['attempt']}。")
         if completed >= count:
-            break
-        status = state.status(key)
-        if status["remaining"] == 0:
-            log(f"当前账号十次总额度已用完；本轮成功 {completed} 次，停止。")
             break
         if wait:
             # User-facing interval is deliberately 301 seconds, one second above
@@ -240,9 +233,7 @@ def main(argv=None) -> int:
         return 0
     except LimitError as exc:
         suffix = ""
-        if exc.exhausted:
-            suffix = "；当前账号十次额度已用完"
-        elif exc.pending:
+        if exc.pending:
             suffix = "；该状态不能靠等待自动解除"
         elif exc.wait_seconds:
             suffix = f"；仍需等待 {math.ceil(exc.wait_seconds)} 秒"

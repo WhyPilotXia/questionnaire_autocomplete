@@ -90,9 +90,11 @@ class TestBasics(Base):
     def test_status_initial(self):
         st = self.store.status(self.ident(), now=self.clock())
         self.assertEqual(st["used"], 0)
-        self.assertEqual(st["remaining"], MAX_PER_IDENTITY)
+        self.assertIsNone(st["remaining"])     # 已无累计额度
+        self.assertIsNone(st["quota"])
         self.assertEqual(st["wait_seconds"], 0)
         self.assertFalse(st["blocked"])
+        self.assertIs(st["exhausted"], False)
         for key in ("used", "remaining", "wait_seconds", "blocked"):
             self.assertIn(key, st)
 
@@ -139,18 +141,67 @@ class TestBasics(Base):
         self.assertTrue(st["wait_seconds"] > 0)
         self.assertTrue(st["blocked"])
         self.assertTrue(st["wait_seconds"] > 0 and not st["pending"])
-        # 情况三：额度用尽 —— 不该睡眠
+        # 情况三：连续多次提交后，冷却结束即可继续，不再有额度用尽
         for _ in range(MAX_PER_IDENTITY - 1):
             self.clock.advance(MIN_INTERVAL_SECONDS)
             a = self.store.reserve(ident, now=self.clock())
             self.store.finish(a, "success", now=self.clock())
         self.clock.advance(MIN_INTERVAL_SECONDS)
-        with self.assertRaises(LimitError):
-            self.store.reserve(ident, now=self.clock())
+        self.store.reserve(ident, now=self.clock())   # 第 10 次仍可提交
         st = self.store.status(ident, now=self.clock())
-        self.assertIs(st["exhausted"], True)
-        self.assertIs(st["blocked"], True)
-        self.assertFalse(st["wait_seconds"] > 0 and not st["pending"])
+        self.assertIs(st["exhausted"], False)
+
+    def test_no_cumulative_limit_beyond_ten_and_twenty_one(self):
+        """需求：历史即使 21 次也不再限制，只要过了冷却就能继续提交。"""
+        ident = self.ident()
+        for count in (MAX_PER_IDENTITY, 21, 100):
+            with self.subTest(count=count):
+                self.store.sync_history(ident, count, None)
+                st = self.store.status(ident, now=self.clock())
+                self.assertEqual(st["used"], count)
+                self.assertIs(st["exhausted"], False)
+                self.assertIsNone(st["remaining"])
+                self.assertFalse(st["blocked"])
+                aid = self.store.reserve(ident, now=self.clock())
+                self.store.finish(aid, "success", now=self.clock())
+                self.clock.advance(MIN_INTERVAL_SECONDS)
+
+    def test_local_used_above_ten_keeps_submitting(self):
+        ident = self.ident()
+        for _ in range(15):
+            aid = self.store.reserve(ident, now=self.clock())
+            self.store.finish(aid, "success", now=self.clock())
+            self.clock.advance(MIN_INTERVAL_SECONDS)
+        st = self.store.status(ident, now=self.clock())
+        self.assertEqual(st["used"], 15)
+        self.assertIs(st["exhausted"], False)
+        self.assertFalse(st["blocked"])
+        aid = self.store.reserve(ident, now=self.clock())   # 第 16 次仍可提交
+        self.store.finish(aid, "success", now=self.clock())
+
+    def test_history_twenty_one_with_recent_time_still_cools_down(self):
+        ident = self.ident()
+        self.store.sync_history(ident, 21, 1000)
+        st = self.store.status(ident, now=1100)
+        self.assertEqual(st["used"], 21)
+        self.assertTrue(st["blocked"])
+        self.assertEqual(st["wait_seconds"], 200)
+        with self.assertRaises(LimitError) as ctx:
+            self.store.reserve(ident, now=1100)
+        self.assertFalse(ctx.exception.exhausted)
+        self.assertEqual(ctx.exception.reason, "cooldown")
+        self.store.reserve(ident, now=1300)     # 冷却结束即可继续
+
+    def test_pending_still_blocks_even_without_quota(self):
+        ident = self.ident()
+        self.store.sync_history(ident, 100, None)
+        aid = self.store.reserve(ident, now=self.clock())
+        with self.assertRaises(LimitError) as ctx:
+            self.store.reserve(ident, now=self.clock())
+        self.assertEqual(ctx.exception.reason, "in_flight")
+        self.assertTrue(ctx.exception.pending)
+        self.assertFalse(ctx.exception.exhausted)
+        self.store.finish(aid, "success", now=self.clock())
 
     def test_pending_flag_is_scoped_to_identity(self):
         a, b = self.ident("o1"), self.ident("o2")
@@ -188,14 +239,14 @@ class TestBasics(Base):
         self.assertIsInstance(second, str)
         self.assertNotEqual(aid, second)
 
-    def test_reserve_consumes_quota_immediately(self):
+    def test_reserve_accumulates_used_immediately(self):
         ident = self.ident()
         self.store.reserve(ident, now=self.clock())
         st = self.store.status(ident, now=self.clock())
         self.assertEqual(st["used"], 1)
-        self.assertEqual(st["remaining"], MAX_PER_IDENTITY - 1)
+        self.assertIsNone(st["remaining"])     # 仅记录，不构成额度
 
-    def test_ten_submissions_then_exhausted(self):
+    def test_many_submissions_then_only_cooldown(self):
         ident = self.ident()
         for i in range(MAX_PER_IDENTITY):
             aid = self.store.reserve(ident, now=self.clock())
@@ -203,13 +254,11 @@ class TestBasics(Base):
             self.clock.advance(MIN_INTERVAL_SECONDS)
         st = self.store.status(ident, now=self.clock())
         self.assertEqual(st["used"], MAX_PER_IDENTITY)
-        self.assertEqual(st["remaining"], 0)
-        self.assertTrue(st["exhausted"])
-        self.assertTrue(st["blocked"])
-        with self.assertRaises(LimitError) as ctx:
-            self.store.reserve(ident, now=self.clock())
-        self.assertTrue(ctx.exception.exhausted)
-        self.assertEqual(ctx.exception.reason, "exhausted")
+        self.assertIsNone(st["remaining"])
+        self.assertIs(st["exhausted"], False)     # 不再有额度用尽
+        self.assertFalse(st["blocked"])           # 冷却已过，可继续提交
+        aid = self.store.reserve(ident, now=self.clock())
+        self.store.finish(aid, "success", now=self.clock())
 
     def test_status_default_now_uses_monotonic_real_clock(self):
         ident = self.ident()
@@ -285,7 +334,7 @@ class TestCooldown(Base):
 # 别名：同一个散列 identity 不重置
 # --------------------------------------------------------------------------
 class TestAlias(Base):
-    def test_alias_same_identity_never_resets_quota(self):
+    def test_alias_same_identity_never_resets_used(self):
         ident = hash_identity("oREAL_OPENID")
         self.assertEqual(ident, hash_identity("oREAL_OPENID"))
         for nickname in ("小明", "Ming", "小明 ", "xiaoming"):
@@ -296,10 +345,9 @@ class TestAlias(Base):
             aid = self.store.reserve(ident, now=self.clock())
             self.store.finish(aid, "success", now=self.clock())
             self.clock.advance(MIN_INTERVAL_SECONDS)
-        with self.assertRaises(LimitError) as ctx:
-            self.store.reserve(ident, now=self.clock())
-        self.assertTrue(ctx.exception.exhausted)
-        self.assertEqual(self.store.status(ident, now=self.clock())["used"], MAX_PER_IDENTITY)
+        # 用尽旧常量额度也不再阻止；换回同一 openid 的 used 不会被重置
+        self.store.reserve(ident, now=self.clock())
+        self.assertEqual(self.store.status(ident, now=self.clock())["used"], MAX_PER_IDENTITY + 1)
 
     def test_alias_cannot_escape_cooldown(self):
         """同一个 openid 换别名/换回仍受剩余额度与冷却约束。"""
@@ -348,7 +396,7 @@ class TestAlias(Base):
             self.clock.advance(MIN_INTERVAL_SECONDS)
         self.assertEqual(self.store.status(a, now=self.clock())["used"], 3)
         self.assertEqual(self.store.status(b, now=self.clock())["used"], 0)
-        self.assertEqual(self.store.status(b, now=self.clock())["remaining"], MAX_PER_IDENTITY)
+        self.assertIsNone(self.store.status(b, now=self.clock())["remaining"])
         self.assertEqual(self.store.status(b, now=self.clock())["wait_seconds"], 0)
         self.store.reserve(b, now=self.clock())  # B 不受 A 的冷却影响
 
@@ -362,7 +410,7 @@ class TestSyncHistory(Base):
         self.store.sync_history(ident, 7, 1_600_000_000.0)
         st = self.store.status(ident, now=self.clock())
         self.assertEqual(st["used"], 7)
-        self.assertEqual(st["remaining"], 3)
+        self.assertIsNone(st["remaining"])
         self.assertEqual(st["last_at"], 1_600_000_000.0)
 
     def test_smaller_remote_does_not_rewind(self):
@@ -373,15 +421,13 @@ class TestSyncHistory(Base):
         self.assertEqual(st["used"], 7)
         self.assertEqual(st["last_at"], 1_600_000_000.0)
 
-    def test_sync_beyond_quota_blocks(self):
+    def test_sync_beyond_ten_does_not_block(self):
         ident = self.ident()
         self.store.sync_history(ident, MAX_PER_IDENTITY, None)
         st = self.store.status(ident, now=self.clock())
-        self.assertTrue(st["exhausted"])
-        self.assertTrue(st["blocked"])
-        with self.assertRaises(LimitError) as ctx:
-            self.store.reserve(ident, now=self.clock())
-        self.assertTrue(ctx.exception.exhausted)
+        self.assertIs(st["exhausted"], False)
+        self.assertFalse(st["blocked"])
+        self.store.reserve(ident, now=self.clock())   # 无冷却即可继续
 
     def test_sync_last_at_starts_cooldown(self):
         ident = self.ident()
@@ -497,18 +543,21 @@ class TestFailureAndUnknown(Base):
         self.assertEqual(st["used"], 1)
         self.assertGreater(st["wait_seconds"], 0)
 
-    def test_no_automatic_refund_after_ten_failures(self):
+    def test_no_automatic_refund_after_many_failures(self):
+        """失败仍保守计次、不退款，但累计次数不再阻止后续提交。"""
         ident = self.ident()
         for _ in range(MAX_PER_IDENTITY):
             aid = self.store.reserve(ident, now=self.clock())
             self.store.finish(aid, "rejected", now=self.clock())
             self.clock.advance(MIN_INTERVAL_SECONDS)
         st = self.store.status(ident, now=self.clock())
+        # used 已累加到旧常量额度，但不再产生 exhausted
         self.assertEqual(st["used"], MAX_PER_IDENTITY)
-        self.assertTrue(st["exhausted"])
-        with self.assertRaises(LimitError) as ctx:
-            self.store.reserve(ident, now=self.clock())
-        self.assertTrue(ctx.exception.exhausted)
+        self.assertIs(st["exhausted"], False)
+        self.assertFalse(st["blocked"])
+        aid = self.store.reserve(ident, now=self.clock())
+        self.store.finish(aid, "rejected", now=self.clock())
+        self.assertEqual(self.store.status(ident, now=self.clock())["used"], MAX_PER_IDENTITY + 1)
 
     def test_finish_validates(self):
         ident = self.ident()
@@ -651,7 +700,7 @@ class TestPersistence(Base):
         reopened = StateStore(self.path)
         st = reopened.status(ident, now=self.clock())
         self.assertEqual(st["used"], 4)
-        self.assertEqual(st["remaining"], MAX_PER_IDENTITY - 4)
+        self.assertIsNone(st["remaining"])     # 已无累计额度
         self.assertAlmostEqual(st["last_at"], self.clock.now - MIN_INTERVAL_SECONDS, places=6)
 
     def test_new_instance_reads_same_file(self):
@@ -767,7 +816,8 @@ class TestConcurrency(Base):
         for s in stores:
             self.assertEqual(s.status(ident, now=clock())["used"], 1)
 
-    def test_multi_connection_quota_not_exceeded(self):
+    def test_multi_connection_no_double_spend_beyond_ten(self):
+        """多连接并发下，超过旧常量 10 次也不会错误放行或重复扣减。"""
         ident = self.ident()
         stores = [StateStore(self.path) for _ in range(6)]
         clock = FakeClock()
@@ -776,13 +826,18 @@ class TestConcurrency(Base):
             for s in stores:
                 try:
                     aid = s.reserve(ident, now=clock())
-                except LimitError:
+                except LimitError as exc:
+                    # 只允许冷却/未完成；绝不允许 exhausted
+                    self.assertFalse(exc.exhausted)
                     continue
                 accepted += 1
                 s.finish(aid, "success", now=clock())
                 clock.advance(MIN_INTERVAL_SECONDS)
-        self.assertEqual(accepted, MAX_PER_IDENTITY)
-        self.assertEqual(self.store.status(ident, now=clock())["used"], MAX_PER_IDENTITY)
+        # 无累计上限：所有尝试（30 轮 × 6 连接）全部成功，
+        # 且 used 精确累加、绝不重复扣减
+        self.assertEqual(accepted, MAX_PER_IDENTITY * 3 * 6)
+        self.assertEqual(self.store.status(ident, now=clock())["used"], MAX_PER_IDENTITY * 3 * 6)
+        self.assertIsNone(self.store.status(ident, now=clock())["remaining"])
 
     def test_parallel_finish_only_first_wins(self):
         ident = self.ident()
@@ -815,12 +870,31 @@ class TestConcurrency(Base):
 # --------------------------------------------------------------------------
 class TestApiContract(Base):
     def test_no_tunable_knobs(self):
+        # 兼容常量仍为 10，但已不参与资格判定
         self.assertEqual(MAX_PER_IDENTITY, 10)
         self.assertEqual(MIN_INTERVAL_SECONDS, 300)
-        self.assertEqual(self.store.max_per_identity, 10)
+        # 累计上限已移除：max_per_identity 为 None
+        self.assertIsNone(self.store.max_per_identity)
         self.assertEqual(self.store.min_interval, 300)
         self.assertFalse(hasattr(self.store, "set_max_per_identity"))
         self.assertFalse(hasattr(self.store, "set_interval"))
+
+    def test_reserve_never_exhausts_on_used(self):
+        """reserve() 绝不因累计次数拒绝；只会因冷却或 pending 拒绝。"""
+        ident = self.ident()
+        self.store.sync_history(ident, 100, None)
+        # 无冷却、无 pending 时，累计 100 次之后仍能连续提交
+        for expected in (101, 102, 103):
+            aid = self.store.reserve(ident, now=self.clock())
+            self.store.finish(aid, "success", now=self.clock())
+            self.assertEqual(self.store.status(ident, now=self.clock())["used"], expected)
+            self.clock.advance(MIN_INTERVAL_SECONDS)
+        # 冷却期内只报 cooldown，不报 exhausted
+        self.clock.advance(-1)
+        with self.assertRaises(LimitError) as ctx:
+            self.store.reserve(ident, now=self.clock())
+        self.assertFalse(ctx.exception.exhausted)
+        self.assertEqual(ctx.exception.reason, "cooldown")
 
     def test_reserve_validates(self):
         with self.assertRaises(InvalidArgument):
@@ -889,8 +963,8 @@ class TestApiContract(Base):
         s = self.store.summary(now=self.clock())
         self.assertEqual(s["identity_count"], 2)
         self.assertEqual(s["total_used"], 5)
-        self.assertEqual(s["total_remaining"], MAX_PER_IDENTITY * 2 - 5)
-        self.assertEqual(s["quota"], MAX_PER_IDENTITY)
+        self.assertIsNone(s["total_remaining"])   # 已无累计额度
+        self.assertIsNone(s["quota"])
         self.assertEqual(s["interval"], MIN_INTERVAL_SECONDS)
         self.assertFalse(s["in_flight"])
         self.assertEqual(s["pending"], [])
@@ -904,11 +978,7 @@ class TestApiContract(Base):
         with self.assertRaises(LimitError) as ctx:
             self.store.reserve(ident, now=self.clock())
         self.assertTrue(any("\u4e00" <= ch <= "\u9fff" for ch in str(ctx.exception)))
-        for _ in range(MAX_PER_IDENTITY - 1):
-            self.clock.advance(MIN_INTERVAL_SECONDS)
-            a = self.store.reserve(ident, now=self.clock())
-            self.store.finish(a, "success", now=self.clock())
-        self.clock.advance(MIN_INTERVAL_SECONDS)
+        self.clock.advance(MIN_INTERVAL_SECONDS - 1)
         with self.assertRaises(LimitError) as ctx:
             self.store.reserve(ident, now=self.clock())
         self.assertTrue(any("\u4e00" <= ch <= "\u9fff" for ch in str(ctx.exception)))

@@ -121,13 +121,14 @@ class RunnerTests(unittest.TestCase):
         sent = self.client.submit.call_args.args[0]
         self.assertEqual(sent["userId"], self.openid)
 
-    def test_tenth_and_remote_history_ceiling(self):
-        self.client.history.return_value = (9, None)
+    def test_history_above_twenty_has_no_lifetime_ceiling(self):
+        self.client.history.return_value = (21, None)
         self.perform()
-        self.assertEqual(self.state.status(self.key)["remaining"], 0)
-        with self.assertRaises(LimitError):
-            self.perform()
-        self.client.submit.assert_called_once()
+        status = self.state.status(self.key)
+        self.assertEqual(status["used"], 22)
+        self.assertIsNone(status["remaining"])
+        self.assertFalse(status["exhausted"])
+        self.assertEqual(self.client.submit.call_count, 1)
 
     def test_uncertain_submission_is_counted_and_not_retried(self):
         for failure in (ApiError("network"), KeyboardInterrupt()):

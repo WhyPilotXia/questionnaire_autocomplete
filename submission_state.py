@@ -1,17 +1,18 @@
 # -*- coding: utf-8 -*-
 """问卷提交状态库（submission_state）。
 
-职责：把"每个微信身份最多提交 10 次、两次提交至少间隔 300 秒"这条规则
-落到本地 SQLite 里，并且保证跨进程、跨重启、面对失败/不确定结果时都保守。
+职责：把"同一微信身份两次提交至少间隔 300 秒"这条规则落到本地 SQLite 里，
+并保证跨进程、跨重启、面对失败/不确定结果时都保守。**不再限制累计提交次数**
+（历史 21 次、100 次也可以继续提交），used 仅用于日志展示与 pending 自动核对。
 
 设计要点
 --------
 1. 每个微信身份（调用方传入的**散列** identity，绝不保存 openid 原文）
-   最多 MAX_PER_IDENTITY 次；额度在 reserve() 时就扣掉，失败或不确定也
-   不退款、不自动重试（保守）。
+   **没有累计次数上限**；reserve() 仍会累加 used（失败或不确定也不退款、
+   不自动重试，保守），但 used 不再参与资格判定。
 2. 同一身份两次提交至少间隔 MIN_INTERVAL_SECONDS 秒。冷却与资格判定
    **完全按 identity 划分**：A 账号刚提交过不影响 B 账号立即提交；切换
-   不同微信号可以立刻填答，同一微信号仍受 10 次上限和 300 秒间隔约束。
+   不同微信号可以立刻填答，同一微信号只受 300 秒间隔约束。
 3. 冷却的起点是"提交完成时间"（finish/recover 的时刻），不是预留时刻。
 4. reserve() 会写入 in_flight（pending）标记，**同一 identity 同时只允许
    一个未完成**的提交（原子预留）；另一个 identity 的 pending 不会阻止本
@@ -26,7 +27,10 @@
 7. global_state 仅保留为**统计信息**（最后一次提交时间等），不参与任何
    reserve/status/summary 的资格与冷却判定，旧数据里的未来时间也不会
    阻塞新账号。
-8. 库不提供任何修改 10 / 300 的参数；只接受持久化文件，拒绝 ":memory:"。
+8. 库不提供任何修改 300 的参数；只接受持久化文件，拒绝 ":memory:"。
+   MAX_PER_IDENTITY=10 仅作为旧导出/单轮默认的兼容常量保留，**不参与任何
+   资格判定**；status/summary 的 quota、remaining 为 None，exhausted 恒为
+   False，blocked 只由冷却与 pending 决定。
 
 典型用法::
 
@@ -36,7 +40,7 @@
     ident = hash_identity(openid)          # 只保存散列，不保存 openid
     store.sync_history(ident, remote_count, remote_last_at)   # 可选
     try:
-        attempt_id = store.reserve(ident)
+        attempt_id = store.reserve(ident)  # 只受 300 秒冷却与 pending 限制
     except LimitError as exc:
         print(exc, exc.wait_seconds, exc.exhausted)
         raise
@@ -75,9 +79,11 @@ __all__ = [
 ]
 
 # --------------------------------------------------------------------------
-# 常量：库不提供修改这两个值的入口
+# 常量：库不提供修改间隔的入口；累计次数不再设限
 # --------------------------------------------------------------------------
-MAX_PER_IDENTITY = 10              # 每个微信身份最多提交次数
+# 仅为兼容旧导出/单轮默认值保留，**不参与任何资格判定**。
+# 历史或本地 used 达到/超过它都可以继续提交（需求：21 次也不再限制）。
+MAX_PER_IDENTITY = 10
 MIN_INTERVAL_SECONDS = 300.0       # 同一身份两次提交的最小间隔
 
 OUTCOME_PENDING = "pending"        # 内部状态：已预留、未结束
@@ -98,14 +104,16 @@ class StateStoreError(Exception):
 
 
 class LimitError(StateStoreError):
-    """额度用尽、冷却未到或存在未完成提交时由 reserve() 抛出。
+    """冷却未到或存在未完成提交时由 reserve() 抛出。
+
+    累计次数不再设限，因此本库自身**不会**产出 exhausted=True。
 
     属性：
         message      中文说明（str(e) 即此文本）
         wait_seconds 还需等待的秒数（向上取整），0 表示不是冷却原因
-        exhausted    额度是否已用尽（True 表示再等也不会有额度）
+        exhausted    兼容字段，恒为 False（不再有累计额度限制）
         identity     相关身份散列
-        reason       'exhausted' | 'cooldown' | 'in_flight'
+        reason       'cooldown' | 'in_flight'
         pending      reason=='in_flight' 时为 True：该 identity 存在待处理
                      提交，此时等待（睡眠）没有意义，需要 finish()/
                      recover_pending()（另一个身份的 pending 不影响本身份）
@@ -249,9 +257,13 @@ class StateStore:
 
     # -- 只读属性 ---------------------------------------------------------
     @property
-    def max_per_identity(self) -> int:
-        """每个身份的提交上限（只读）。"""
-        return MAX_PER_IDENTITY
+    def max_per_identity(self) -> Optional[int]:
+        """累计次数上限（只读）。
+
+        已移除累计限制：恒为 None。used 仍会累加，仅供日志展示与 pending
+        自动核对；reserve() 绝不因累计次数拒绝。
+        """
+        return None
 
     @property
     def min_interval(self) -> float:
@@ -462,8 +474,11 @@ class StateStore:
         额外字段：exhausted / pending / in_flight / pending_attempt_id /
         last_at / global_last_at / global_wait_seconds / quota / interval /
         now。
-        - blocked：本身份不能提交（本身份额度用尽、冷却未到或 pending）。
-          另一个身份的提交或 pending 不影响本身份。
+        - blocked：本身份不能提交（冷却未到或存在 pending）。**累计次数不再
+          参与判定**：used 再大也不会让 blocked 为真；另一个身份的提交或
+          pending 不影响本身份。
+        - remaining / quota：恒为 None（已无累计额度），仅为接口兼容保留。
+        - exhausted：恒为 False，仅为接口兼容保留。
         - pending：仅该 identity 存在待处理提交；True 时不应睡眠等待，而应
           finish() 或 recover_pending()。
         - in_flight：与 pending 同义的别名。
@@ -480,14 +495,13 @@ class StateStore:
             global_last = self._global_last(conn)
             pending = self._pending_row(conn, identity)
             wait = _ceil_wait(self._identity_deadline(identity_last), now_eff)
-            remaining = max(0, MAX_PER_IDENTITY - used)
             return {
                 "identity": identity,
                 "used": used,
-                "remaining": remaining,
+                "remaining": None,
                 "wait_seconds": wait,
-                "blocked": bool(remaining == 0 or wait > 0 or pending is not None),
-                "exhausted": bool(used >= MAX_PER_IDENTITY),
+                "blocked": bool(wait > 0 or pending is not None),
+                "exhausted": False,
                 "pending": pending is not None,
                 "in_flight": pending is not None,
                 "pending_attempt_id": pending[0] if pending else None,
@@ -498,7 +512,7 @@ class StateStore:
                     None if global_last is None else float(global_last) + MIN_INTERVAL_SECONDS,
                     now_eff,
                 ),
-                "quota": MAX_PER_IDENTITY,
+                "quota": None,
                 "interval": MIN_INTERVAL_SECONDS,
                 "now": now_eff,
             }
@@ -519,33 +533,31 @@ class StateStore:
             pending_by_identity = {r[1]: r[0] for r in pending_rows}
             items: Dict[str, Dict[str, Any]] = {}
             total_used = 0
-            total_remaining = 0
             for identity, used, last_at in conn.execute(
                 "SELECT identity, used, last_at FROM identities ORDER BY identity"
             ).fetchall():
                 used = int(used)
-                remaining = max(0, MAX_PER_IDENTITY - used)
                 wait = _ceil_wait(self._identity_deadline(last_at), now_eff)
                 own_pending = pending_by_identity.get(identity)
                 items[identity] = {
                     "used": used,
-                    "remaining": remaining,
+                    "remaining": None,
                     "wait_seconds": wait,
-                    "blocked": bool(remaining == 0 or wait > 0 or own_pending is not None),
-                    "exhausted": used >= MAX_PER_IDENTITY,
+                    # 只由冷却与 pending 决定；累计次数不参与。
+                    "blocked": bool(wait > 0 or own_pending is not None),
+                    "exhausted": False,
                     "pending": own_pending is not None,
                     "pending_attempt_id": own_pending,
                     "last_at": last_at,
                 }
                 total_used += used
-                total_remaining += remaining
             return {
                 "now": now_eff,
-                "quota": MAX_PER_IDENTITY,
+                "quota": None,
                 "interval": MIN_INTERVAL_SECONDS,
                 "identity_count": len(items),
                 "total_used": total_used,
-                "total_remaining": total_remaining,
+                "total_remaining": None,
                 "global_last_at": global_last,
                 "global_wait_seconds": _ceil_wait(
                     None if global_last is None else float(global_last) + MIN_INTERVAL_SECONDS,
@@ -592,7 +604,9 @@ class StateStore:
     def reserve(self, identity: str, now: Optional[float] = None) -> str:
         """预留一次提交，返回 attempt_id。
 
-        额度在此时就扣掉（失败/不确定也不退款）。不满足条件时抛 LimitError。
+        used 在此时累加（失败/不确定也不退款），但**累计次数不再限制资格**：
+        reserve() 绝不因 used 达到/超过 10、21 或 100 而拒绝。真正会拒绝的
+        只有两类：本 identity 冷却未到、本 identity 存在 pending。
         判定只针对本 identity：其他账号的提交/pending 不阻止本次预留。
         """
         identity = _coerce_identity(identity)
@@ -606,25 +620,16 @@ class StateStore:
             used = int(row[0])
             identity_last = row[1]
             wait = _ceil_wait(self._identity_deadline(identity_last), now_eff)
-            exhausted = used >= MAX_PER_IDENTITY
 
             pending = self._pending_row(conn, identity)
             if pending is not None:
                 raise LimitError(
                     "该身份存在未完成的提交（attempt_id=%s），不允许自动重试；"
                     "请先调用 finish() 或 recover_pending()" % pending[0],
-                    wait_seconds=max(wait, MIN_INTERVAL_SECONDS),
-                    exhausted=exhausted,
+                    wait_seconds=0.0,
+                    exhausted=False,
                     identity=identity,
                     reason="in_flight",
-                )
-            if exhausted:
-                raise LimitError(
-                    "该身份已提交 %d 次，达到上限 %d 次，不能再提交" % (used, MAX_PER_IDENTITY),
-                    wait_seconds=wait,
-                    exhausted=True,
-                    identity=identity,
-                    reason="exhausted",
                 )
             if wait > 0:
                 raise LimitError(
@@ -634,7 +639,6 @@ class StateStore:
                     identity=identity,
                     reason="cooldown",
                 )
-
             attempt_id = uuid.uuid4().hex
             conn.execute(
                 "UPDATE identities SET used=? WHERE identity=?", (used + 1, identity)
@@ -718,9 +722,9 @@ class StateStore:
     def recover_pending(self, now: Optional[float] = None) -> List[str]:
         """把崩溃遗留的 pending 标记为 unknown，并从当前时刻再等 300 秒。
 
-        返回被恢复的 attempt_id 列表（按预留时间排序）。恢复后各身份的额度
+        返回被恢复的 attempt_id 列表（按预留时间排序）。恢复后各身份的 used
         已被占用（不退款），冷却从 now 重新计时，且只影响对应身份；其他
-        身份不受影响。
+        身份不受影响（累计次数不限制之后的提交）。
         """
         conn = self._connect()
         committed = False

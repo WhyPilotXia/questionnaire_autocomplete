@@ -4,7 +4,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from submission_state import InvalidArgument, LimitError, StateStore
+from submission_state import (
+    MIN_INTERVAL_SECONDS,
+    InvalidArgument,
+    LimitError,
+    StateStore,
+)
 
 
 class SafetyTests(unittest.TestCase):
@@ -76,6 +81,57 @@ class SafetyTests(unittest.TestCase):
             db.close()
         with self.assertRaises(sqlite3.DatabaseError):
             StateStore(self.path)
+
+    def test_no_cumulative_quota_21_then_100_history(self):
+        """需求：历史 21 次（乃至 100 次）后，只要无冷却仍可继续提交。"""
+        for count in (21, 100):
+            with self.subTest(count=count):
+                state = StateStore(Path(self.temp.name) / f"q{count}.sqlite3")
+                state.sync_history("acct", count, None)
+                st = state.status("acct", now=10_000)
+                self.assertEqual(st["used"], count)
+                self.assertIs(st["exhausted"], False)
+                self.assertIsNone(st["remaining"])
+                self.assertIsNone(st["quota"])
+                self.assertFalse(st["blocked"])
+                state.reserve("acct", now=10_000)
+
+    def test_reserve_never_exhausts_and_used_keeps_accumulating(self):
+        state = self.state
+        for expected in range(1, 14):
+            now = float(expected) * MIN_INTERVAL_SECONDS
+            aid = state.reserve("acct", now=now)
+            state.finish(aid, "success", now=now)
+            st = state.status("acct", now=now)
+            self.assertEqual(st["used"], expected)
+            self.assertIs(st["exhausted"], False)
+        # 第 14 次之后（早已超过旧常量 10）冷却到期仍可提交
+        now = 14 * MIN_INTERVAL_SECONDS
+        aid = state.reserve("acct", now=now)
+        state.finish(aid, "success", now=now)
+        self.assertEqual(state.status("acct", now=now)["used"], 14)
+
+    def test_history_21_with_recent_time_still_cools(self):
+        self.state.sync_history("acct", 21, 1000)
+        st = self.state.status("acct", now=1100)
+        self.assertEqual(st["used"], 21)
+        self.assertTrue(st["blocked"])
+        self.assertEqual(st["wait_seconds"], 200)
+        with self.assertRaises(LimitError) as ctx:
+            self.state.reserve("acct", now=1100)
+        self.assertFalse(ctx.exception.exhausted)
+        self.assertEqual(ctx.exception.reason, "cooldown")
+        self.state.reserve("acct", now=1300)
+
+    def test_pending_still_blocks_without_quota(self):
+        self.state.sync_history("acct", 100, None)
+        aid = self.state.reserve("acct", now=1000)
+        with self.assertRaises(LimitError) as ctx:
+            self.state.reserve("acct", now=1000)
+        self.assertEqual(ctx.exception.reason, "in_flight")
+        self.assertTrue(ctx.exception.pending)
+        self.assertFalse(ctx.exception.exhausted)
+        self.state.finish(aid, "success", now=1000)
 
 
 if __name__ == "__main__":
