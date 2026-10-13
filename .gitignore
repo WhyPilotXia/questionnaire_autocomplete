@@ -1,0 +1,17 @@
+# Local captures, identities and personal source data must never be committed.
+/capture/
+/name-source/
+/.local/
+/local_settings.py
+/accounts*.json
+*.sqlite3
+*.sqlite3-*
+.env
+.env.*
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.coverage
+htmlcov/
