@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 from capture_parser import import_openid
 from questionnaire import Questionnaire, load_names, preview
 from submission_state import LimitError, StateStore
-from wechat_client import AccountStore, ApiClient, ApiError, identity_key, validate_openid
+from wechat_client import AccountStore, ApiClient, ApiError, RetryableTransportError, identity_key, validate_openid
 
 ROOT = Path(__file__).resolve().parent
 LOCAL = ROOT / ".local"
@@ -24,6 +24,7 @@ STATE_DB = LOCAL / "submissions.sqlite3"
 SETTINGS_FILE = ROOT / "local_settings.py"
 DEFAULT_COUNT = 10
 SUBMISSION_INTERVAL_SECONDS = 301
+TRANSPORT_RETRY_DELAYS = (5, 10, 20, 40, 80, 160, 300, 300, 300, 300)
 
 
 def log(message: str, level: str = "INFO") -> None:
@@ -76,6 +77,42 @@ def add_run_options(parser, *, child=False):
     parser.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS if child else False, help="仅离线预览，不联网、不计次")
 
 
+def submit_payload_with_retry(client: ApiClient, state: StateStore, attempt: str,
+                              openid: str, payload: dict, baseline_count: int) -> dict:
+    """Retry ambiguous transport failures, checking history before every re-POST."""
+    try:
+        return client.submit(payload)
+    except RetryableTransportError as first_error:
+        last_error = first_error
+        log(f"提交连接异常：{first_error}；将按退避策略最多重试 {len(TRANSPORT_RETRY_DELAYS)} 次。", "ERROR")
+
+    pending = {item["attempt_id"]: item for item in state.pending()}
+    reserved_at = pending[attempt]["reserved_at"]
+    for retry_no, delay in enumerate(TRANSPORT_RETRY_DELAYS, 1):
+        log(f"提交重试 {retry_no}/{len(TRANSPORT_RETRY_DELAYS)}：等待 {delay} 秒后先核对服务端历史。")
+        wait_before_next(delay)
+        try:
+            remote_count, remote_last_at = client.history(openid)
+        except RetryableTransportError as probe_error:
+            last_error = probe_error
+            log(f"重试 {retry_no}/{len(TRANSPORT_RETRY_DELAYS)} 历史核对连接异常，暂不重发 POST：{probe_error}。", "ERROR")
+            continue
+        if (remote_count > baseline_count and remote_last_at is not None
+                and remote_last_at >= reserved_at):
+            log(f"服务端历史已从 {baseline_count} 增至 {remote_count}，确认原请求已经成功；不再重发 POST。")
+            return {"status": 200, "message": "提交成功", "reconciled": True}
+        try:
+            log(f"服务端历史仍为 {remote_count} 次，执行第 {retry_no}/{len(TRANSPORT_RETRY_DELAYS)} 次 POST 重试。")
+            return client.submit(payload)
+        except RetryableTransportError as retry_error:
+            last_error = retry_error
+            log(f"第 {retry_no}/{len(TRANSPORT_RETRY_DELAYS)} 次 POST 重试仍连接异常：{retry_error}。", "ERROR")
+
+    raise RetryableTransportError(
+        f"提交连接异常，已完成 {len(TRANSPORT_RETRY_DELAYS)} 次退避重试仍未得到明确结果；停止并保守计次"
+    ) from last_error
+
+
 def submit_once(questionnaire: Questionnaire, names: list[str], openid: str,
                 client: ApiClient, state: StateStore) -> dict:
     key = identity_key(openid)
@@ -110,7 +147,7 @@ def submit_once(questionnaire: Questionnaire, names: list[str], openid: str,
     attempt = state.reserve(key)
     outcome = "unknown"
     try:
-        response = client.submit(payload)
+        response = submit_payload_with_retry(client, state, attempt, openid, payload, count)
         if response.get("status") == 200 and response.get("message") == "提交成功":
             outcome = "success"
             return {"attempt": attempt, "result": "提交成功"}

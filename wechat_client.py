@@ -17,7 +17,11 @@ from capture_parser import APP_ID, BASE_URL, GATE_PATH, HISTORY_PATH, LOGIN_PATH
 
 
 class ApiError(RuntimeError):
-    pass
+    """Non-retryable protocol, authorization or business/API error."""
+
+
+class RetryableTransportError(ApiError):
+    """Connection/timeout/response-decode failure that may be retried safely by policy."""
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -64,7 +68,8 @@ class ApiClient:
             raise ApiError(f"接口 {path} 返回 HTTP {code}；停止，不自动重试") from None
         except (URLError, OSError, http.client.HTTPException, UnicodeError, ValueError):
             # Exception strings may contain the entire credential-bearing request URL.
-            raise ApiError(f"接口 {path} 连接失败或响应无法解析；停止，不自动重试") from None
+            # The caller decides whether/how to retry; never retry inside request().
+            raise RetryableTransportError(f"接口 {path} 连接失败或响应无法解析") from None
         if not isinstance(result, dict):
             raise ApiError("接口返回的不是 JSON 对象")
         return result

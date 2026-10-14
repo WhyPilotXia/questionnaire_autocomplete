@@ -10,10 +10,10 @@ from unittest.mock import Mock, patch
 from urllib.error import HTTPError, URLError
 
 from capture_parser import BASE_URL, GATE_PATH, HISTORY_PATH, LOGIN_PATH, SUBMIT_PATH
-from main import main, run_submissions, submit_once
+from main import TRANSPORT_RETRY_DELAYS, main, run_submissions, submit_once
 from questionnaire import Questionnaire, TemplateError
 from submission_state import LimitError, StateStore
-from wechat_client import AccountStore, ApiClient, ApiError, NoRedirect, identity_key
+from wechat_client import AccountStore, ApiClient, ApiError, NoRedirect, RetryableTransportError, identity_key
 from tests.test_questionnaire import full_exchange, make_template
 
 
@@ -73,10 +73,11 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(json.loads(req.data), {"userName": "测试", "userId": "private"})
         self.assertNotIn("Content-length", req.headers)
         self.assertIn("servicewechat.com", req.headers["Referer"])
-        for failure in (URLError("https://secret-code"), HTTPError("secret-url", 401, "secret", {}, None)):
+        for failure, error_type in ((URLError("https://secret-code"), RetryableTransportError),
+                                    (HTTPError("secret-url", 401, "secret", {}, None), ApiError)):
             client.opener.open.reset_mock()
             client.opener.open.side_effect = failure
-            with self.assertRaises(ApiError) as raised:
+            with self.assertRaises(error_type) as raised:
                 client.login("private-code")
             self.assertNotIn("secret", str(raised.exception))
             self.assertNotIn("private-code", str(raised.exception))
@@ -130,8 +131,8 @@ class RunnerTests(unittest.TestCase):
         self.assertFalse(status["exhausted"])
         self.assertEqual(self.client.submit.call_count, 1)
 
-    def test_uncertain_submission_is_counted_and_not_retried(self):
-        for failure in (ApiError("network"), KeyboardInterrupt()):
+    def test_uncertain_nonretryable_submission_is_counted_once(self):
+        for failure in (ApiError("business/protocol failure"), KeyboardInterrupt()):
             with self.subTest(failure=type(failure).__name__):
                 state = StateStore(Path(self.temp.name) / (type(failure).__name__ + ".sqlite3"))
                 self.client.submit.reset_mock()
@@ -141,6 +142,53 @@ class RunnerTests(unittest.TestCase):
                 self.assertEqual(state.status(self.key)["used"], 1)
                 self.assertTrue(state.status(self.key)["blocked"])
                 self.client.submit.assert_called_once()
+
+    def test_retryable_submit_failure_waits_5_then_10_and_succeeds(self):
+        self.client.submit.side_effect = [RetryableTransportError("net1"), RetryableTransportError("net2"), {"status": 200, "message": "提交成功"}]
+        self.client.history.side_effect = [(0, None), (0, None), (0, None)]
+        waits = []
+        with patch("main.wait_before_next", side_effect=waits.append), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            result = self.perform()
+        self.assertEqual(result["result"], "提交成功")
+        self.assertEqual(waits, [5, 10])
+        self.assertEqual(self.client.submit.call_count, 3)
+        self.assertEqual(self.client.history.call_count, 3)
+        self.assertEqual(self.state.status(self.key)["used"], 1)
+
+    def test_retry_checks_history_and_does_not_duplicate_accepted_post(self):
+        self.client.submit.side_effect = RetryableTransportError("response lost")
+        self.client.history.side_effect = [(7, None), (8, 1011)]
+        with patch("submission_state.time.time", return_value=1000), patch("main.wait_before_next") as wait, redirect_stdout(io.StringIO()) as output:
+            result = self.perform()
+        self.assertEqual(result["result"], "提交成功")
+        self.assertEqual(self.client.submit.call_count, 1)
+        self.assertEqual(self.client.history.call_count, 2)
+        wait.assert_called_once_with(5)
+        self.assertIn("不再重发 POST", output.getvalue())
+        outcomes = [r[0] for r in self.state._connect().execute("SELECT outcome FROM attempts").fetchall()]
+        self.assertEqual(outcomes, ["success"])
+
+    def test_retry_exhaustion_performs_ten_retries_and_counts_once(self):
+        self.client.submit.side_effect = RetryableTransportError("always down")
+        self.client.history.side_effect = [(0, None)] + [(0, None)] * len(TRANSPORT_RETRY_DELAYS)
+        waits = []
+        with patch("main.wait_before_next", side_effect=waits.append), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            with self.assertRaises(RetryableTransportError):
+                self.perform()
+        self.assertEqual(waits, list(TRANSPORT_RETRY_DELAYS))
+        self.assertEqual(self.client.submit.call_count, 1 + len(TRANSPORT_RETRY_DELAYS))
+        self.assertEqual(self.client.history.call_count, 1 + len(TRANSPORT_RETRY_DELAYS))
+        self.assertEqual(self.state.status(self.key)["used"], 1)
+
+    def test_history_probe_transport_failure_does_not_blindly_repost(self):
+        self.client.submit.side_effect = [RetryableTransportError("post lost"), {"status": 200, "message": "提交成功"}]
+        self.client.history.side_effect = [(0, None), RetryableTransportError("probe down"), (0, None)]
+        waits = []
+        with patch("main.wait_before_next", side_effect=waits.append), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            result = self.perform()
+        self.assertEqual(result["result"], "提交成功")
+        self.assertEqual(waits, [5, 10])
+        self.assertEqual(self.client.submit.call_count, 2)
 
     def test_http_ok_business_failure_is_not_success(self):
         for index, result in enumerate(({"status": 200, "message": "未知"}, {"status": 500, "message": "拒绝"}, {})):
@@ -241,15 +289,15 @@ class RunnerTests(unittest.TestCase):
         accounts.assert_not_called()
         self.assertEqual(sleep.call_count, 9)
 
-    def test_exception_is_logged_and_stops_without_retry(self):
-        self.client.submit.side_effect = ApiError("simulated failure")
+    def test_nonretryable_exception_is_logged_and_stops_without_retry(self):
+        self.client.submit.side_effect = ApiError("simulated business failure")
         output, errors = io.StringIO(), io.StringIO()
         with redirect_stdout(output), redirect_stderr(errors):
             with self.assertRaises(ApiError):
                 run_submissions(self.questionnaire, ["测试"], self.openid, self.client, self.state, count=10, wait=True)
         self.client.submit.assert_called_once()
         self.assertIn("第 1/10 次发生异常", errors.getvalue())
-        self.assertIn("simulated failure", errors.getvalue())
+        self.assertIn("simulated business failure", errors.getvalue())
 
     def test_explicit_openid_overrides_default_before_or_after_subcommand(self):
         for argv in (["--openid", "explicit"], ["submit", "--openid", "explicit"], ["--openid", "explicit", "submit"]):
