@@ -24,6 +24,30 @@ class RetryableTransportError(ApiError):
     """Connection/timeout/response-decode failure that may be retried safely by policy."""
 
 
+def response_summary(result: object) -> str:
+    """Return useful server diagnostics without dumping credentials or huge payloads."""
+    if not isinstance(result, dict):
+        return f"响应类型={type(result).__name__}"
+    parts = []
+    for key in ("status", "code", "message", "msg", "error", "errMsg"):
+        value = result.get(key)
+        if value not in (None, ""):
+            text = str(value).replace("\r", " ").replace("\n", " ")[:300]
+            parts.append(f"{key}={text!r}")
+    data = result.get("data")
+    if data is not None:
+        if isinstance(data, (str, int, float, bool)):
+            parts.append(f"data={str(data)[:300]!r}")
+        elif isinstance(data, list):
+            parts.append(f"data类型=list,数量={len(data)}")
+        elif isinstance(data, dict):
+            safe_keys = sorted(k for k in data if k not in ("openid", "session_key", "code", "token"))
+            parts.append(f"data类型=dict,字段={safe_keys[:20]!r}")
+        else:
+            parts.append(f"data类型={type(data).__name__}")
+    return ", ".join(parts) or f"响应字段={sorted(result)[:20]!r}"
+
+
 class NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         # Never leak openid or login code to a redirect target; never replay POST.
@@ -80,7 +104,7 @@ class ApiClient:
         result = self.request("POST", LOGIN_PATH, query={"code": code}, body={})
         data = result.get("data")
         if result.get("status") != 200 or not isinstance(data, dict):
-            raise ApiError("登录失败；旧 code 不可重放，请在当前微信账号重新登录")
+            raise ApiError(f"登录失败：{response_summary(result)}；旧 code 不可重放，请在当前微信账号重新登录")
         openid = data.get("openid")
         validate_openid(openid)
         # session_key is deliberately not returned, logged or persisted.
@@ -89,7 +113,7 @@ class ApiClient:
     def history(self, openid: str) -> tuple[int, float | None]:
         result = self.request("GET", HISTORY_PATH, query={"userId": openid})
         if result.get("status") != 200 or result.get("message") != "查询成功" or not isinstance(result.get("data"), list):
-            raise ApiError("无法确认历史次数，停止提交；请核对账号授权")
+            raise ApiError(f"无法确认历史次数：{response_summary(result)}；停止提交，请核对账号授权")
         records = {}
         for record in result["data"]:
             if not isinstance(record, dict) or not isinstance(record.get("treUserWjId"), str) or not record["treUserWjId"]:
@@ -110,10 +134,14 @@ class ApiClient:
         query = {"treOfWjId": survey_id, "userId": openid}
         gate = self.request("GET", GATE_PATH, query={**query, "type": ""})
         if gate.get("status") != 200 or gate.get("message") != "可填写" or gate.get("data") != "N":
-            raise ApiError("服务端未明确允许填写（可能已满额、未到间隔或授权失效），停止")
+            raise ApiError(
+                f"填写资格检查未通过：{response_summary(gate)}；"
+                f"survey={survey_id[-8:]}, account={identity_key(openid)[:12]}。"
+                "可能原因包括该问卷/地区已完成、服务端间隔、任务关闭或身份不适用"
+            )
         questions = self.request("GET", QUESTIONS_PATH, query=query)
         if questions.get("status") != 200 or questions.get("message") != "可填写" or not isinstance(questions.get("data"), list):
-            raise ApiError("服务端未返回可填写问卷，停止")
+            raise ApiError(f"服务端未返回可填写问卷：{response_summary(questions)}；停止")
         return questions["data"]
 
     def submit(self, payload: dict) -> dict:

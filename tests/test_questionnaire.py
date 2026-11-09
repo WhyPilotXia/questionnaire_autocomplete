@@ -40,20 +40,25 @@ def full_exchange(path, method, request, response, chunked=False):
 
 
 class QuestionnaireTests(unittest.TestCase):
-    def test_random_single_preserves_multi_and_template(self):
+    def test_random_single_and_two_multi_options_without_mutating_template(self):
         payload, schema = make_template()
         original = copy.deepcopy(payload)
         q = Questionnaire(payload, schema)
         selections = set()
+        multi_selections = set()
         names = set()
         for seed in range(30):
             built = q.build("new-account", ["甲", "乙"], random.Random(seed))
             self.assertEqual(built["userId"], "new-account")
             names.add(built["userName"])
             selections.add(built["data"][0]["optionIds"])
-            self.assertEqual(built["data"][1], original["data"][1])
+            multi = built["data"][1]["optionIds"].split(",")
+            self.assertEqual(len(multi), 2)
+            self.assertEqual(multi, sorted(multi))
+            multi_selections.add(tuple(multi))
             self.assertEqual(built["data"][0]["optionList"], original["data"][0]["optionList"])
         self.assertEqual(selections, {"q1a", "q1b", "q1c"})
+        self.assertEqual(multi_selections, {("q2a", "q2b"), ("q2a", "q2c"), ("q2b", "q2c")})
         self.assertEqual(names, {"甲", "乙"})
         self.assertEqual(payload, original)
         self.assertNotIn("userId", q.payload)
@@ -155,6 +160,26 @@ class QuestionnaireTests(unittest.TestCase):
             with self.assertRaises(TemplateError):
                 load_names(names_path)
 
+    def test_post_only_success_capture_is_accepted_as_strict_template(self):
+        payload, _ = make_template()
+        text = full_exchange(SUBMIT_PATH, "POST", payload, {"status": 200, "message": "提交成功"})
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "post-only.txt"
+            path.write_text(text, encoding="utf-8")
+            q = Questionnaire.from_capture(path)
+            self.assertEqual(q.survey_id, "survey-1")
+            q.check_live_schema(q.schema)
+
+    @unittest.skipUnless((Path(__file__).resolve().parents[1] / "capture/提交问卷2.txt").exists(), "本地最新提交抓包未提供")
+    def test_latest_post_only_capture_randomizes_multi_two(self):
+        root = Path(__file__).resolve().parents[1]
+        q = Questionnaire.from_capture(root / "capture/提交问卷2.txt")
+        self.assertEqual(len(q.schema), 41)
+        self.assertEqual(sum(s["subjectType"] == "单选" for s in q.schema), 38)
+        self.assertEqual([s["subjectNo"] for s in q.schema if s["subjectType"] == "多选"], [14, 21, 34])
+        built = q.build("offline-test", ["测试"], random.Random(42))
+        self.assertTrue(all(len(s["optionIds"].split(",")) == 2 for s in built["data"] if s["subjectType"] == "多选"))
+
     @unittest.skipUnless((Path(__file__).resolve().parents[1] / "capture/1_Full.txt").exists(), "本地私有抓包未提供")
     def test_local_capture_offline_integration(self):
         root = Path(__file__).resolve().parents[1]
@@ -165,7 +190,10 @@ class QuestionnaireTests(unittest.TestCase):
         built = q.build("offline-test", names, random.Random(42))
         for before, after in zip(q.payload["data"], built["data"]):
             if before["subjectType"] == "多选":
-                self.assertEqual(before, after)
+                selected = after["optionIds"].split(",")
+                self.assertEqual(len(selected), 2)
+                expected_order = [o["optionId"] for o in before["optionList"] if o["optionId"] in selected]
+                self.assertEqual(selected, expected_order)
         self.assertEqual(built["userId"], "offline-test")
         self.assertIn(built["userName"], names)
 

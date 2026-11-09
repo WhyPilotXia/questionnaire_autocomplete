@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 from capture_parser import import_openid
 from questionnaire import Questionnaire, load_names, preview
 from submission_state import LimitError, StateStore
-from wechat_client import AccountStore, ApiClient, ApiError, RetryableTransportError, identity_key, validate_openid
+from wechat_client import AccountStore, ApiClient, ApiError, RetryableTransportError, identity_key, response_summary, validate_openid
 
 ROOT = Path(__file__).resolve().parent
 LOCAL = ROOT / ".local"
@@ -154,7 +154,7 @@ def submit_once(questionnaire: Questionnaire, names: list[str], openid: str,
         # HTTP 200 alone is NOT success; unrecognized replies remain ambiguous.
         if isinstance(response.get("status"), int) and response["status"] != 200:
             outcome = "rejected"
-        raise ApiError("服务端未明确返回提交成功；已保守计次并停止，请在小程序核实")
+        raise ApiError(f"服务端未明确返回提交成功：{response_summary(response)}；已保守计次并停止，请在小程序核实")
     finally:
         # Includes network errors, Ctrl+C and JSON/business failures. No retry/refund.
         # Hard termination leaves a pending row, blocking further submissions.
@@ -200,7 +200,7 @@ def run_submissions(questionnaire, names, openid, client, state, *, count, wait)
 
 def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--capture", type=Path, default=ROOT / "capture" / "1_Full.txt", help="完整问卷模板抓包")
+    parser.add_argument("--capture", type=Path, default=ROOT / "capture" / "提交问卷2.txt", help="成功提交模板抓包（可只有POST；默认最新问卷）")
     parser.add_argument("--names", type=Path, default=ROOT / "names.json", help="纯姓名 JSON 列表")
     add_run_options(parser)
     sub = parser.add_subparsers(dest="command")

@@ -48,14 +48,20 @@ class ClientTests(unittest.TestCase):
             with self.assertRaises(ApiError):
                 client.history("test-account")
 
-    def test_gate_unknown_or_denial_stops_before_questions(self):
+    def test_gate_unknown_or_denial_reports_server_details(self):
         client = ApiClient()
         for response in ({"status": 200, "message": "可填写", "data": "Y"},
                          {"status": 200, "message": "五分钟内不可填写", "data": "N"},
-                         {"status": 401, "message": "可填写", "data": "N"}):
+                         {"status": 401, "message": "未授权", "data": "N"}):
             client.request = Mock(return_value=response)
-            with self.assertRaises(ApiError):
-                client.available_questions("test-account", "survey")
+            with self.assertRaises(ApiError) as raised:
+                client.available_questions("test-account", "survey-12345678")
+            text = str(raised.exception)
+            self.assertIn(f"status={str(response['status'])!r}", text)
+            self.assertIn(f"message={response['message']!r}", text)
+            self.assertIn(f"data={response['data']!r}", text)
+            self.assertIn("survey=12345678", text)
+            self.assertNotIn("test-account", text)
             client.request.assert_called_once()
 
     def test_transport_json_utf8_headers_and_no_credentials_in_errors(self):

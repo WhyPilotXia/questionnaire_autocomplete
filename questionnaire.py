@@ -60,6 +60,8 @@ def validate_questions(questions: object, *, answered: bool) -> None:
                 raise TemplateError("抓包答案包含重复或未知选项")
             if question["subjectType"] == "单选" and len(selected_ids) != 1:
                 raise TemplateError("单选答案不止一个")
+            if question["subjectType"] == "多选" and len(selected_ids) < 1:
+                raise TemplateError("多选答案为空")
 
 
 def _normalized_schema(questions: list[dict]) -> list[dict]:
@@ -103,14 +105,26 @@ class Questionnaire:
     def from_capture(cls, path: Path) -> "Questionnaire":
         exchanges = read_exchanges(path)
         submitted = find_exchange(exchanges, SUBMIT_PATH)
-        schema_exchange = find_exchange(exchanges, QUESTIONS_PATH)
-        if submitted.method != "POST" or schema_exchange.method != "GET":
-            raise CaptureError("抓包接口请求方法与预期不符")
-        for exchange in (submitted, schema_exchange):
-            if exchange.http_status != 200 or not isinstance(exchange.response, dict) or exchange.response.get("status") != 200:
-                raise CaptureError("模板必须来自成功获取并成功提交的抓包")
-        if submitted.response.get("message") != "提交成功":
+        if submitted.method != "POST" or submitted.http_status != 200:
+            raise CaptureError("提交抓包请求方法或 HTTP 状态与预期不符")
+        if not isinstance(submitted.response, dict) or submitted.response.get("status") != 200 or submitted.response.get("message") != "提交成功":
             raise CaptureError("未观察到明确的提交成功响应")
+        try:
+            schema_exchange = find_exchange(exchanges, QUESTIONS_PATH)
+        except CaptureError:
+            # A successful POST contains the complete option schema. It can serve as
+            # a strict offline template; the live GET is still compared before submit.
+            schema = copy.deepcopy(submitted.request.get("data")) if isinstance(submitted.request, dict) else None
+            if isinstance(schema, list):
+                for question in schema:
+                    if isinstance(question, dict):
+                        question["optionIds"] = ""
+                        question["showTitle"] = "true"
+            return cls(submitted.request, schema)
+        if schema_exchange.method != "GET" or schema_exchange.http_status != 200:
+            raise CaptureError("问卷定义抓包请求方法或 HTTP 状态与预期不符")
+        if not isinstance(schema_exchange.response, dict) or schema_exchange.response.get("status") != 200:
+            raise CaptureError("模板必须来自成功获取的问卷定义")
         return cls(submitted.request, schema_exchange.response.get("data"))
 
     @property
@@ -132,9 +146,17 @@ class Questionnaire:
         payload["userId"] = openid
         payload["userName"] = rng.choice(names)
         for question in payload["data"]:
+            options = question["optionList"]
             if question["subjectType"] == "单选":
-                question["optionIds"] = rng.choice(question["optionList"])["optionId"]
-            # Multiple-choice objects, order and comma-separated selections remain exact.
+                question["optionIds"] = rng.choice(options)["optionId"]
+            else:
+                if len(options) < 2:
+                    raise TemplateError("多选题少于2个选项，无法按要求随机选择2项")
+                # Keep option-list order in the comma-separated answer, matching captures.
+                selected = set(rng.sample(range(len(options)), 2))
+                question["optionIds"] = ",".join(
+                    option["optionId"] for index, option in enumerate(options) if index in selected
+                )
         validate_questions(payload["data"], answered=True)
         return payload
 
